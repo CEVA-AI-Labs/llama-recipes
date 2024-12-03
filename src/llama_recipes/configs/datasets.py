@@ -38,3 +38,9 @@ class llamaguard_toxicchat_dataset:
     dataset: str = "llamaguard_toxicchat_dataset"
     train_split: str = "train"
     test_split: str = "test"
+
+@dataclass
+class wikitext_dataset:
+    dataset: str = "wikitext_dataset"
+    train_split: str = "train"
+    test_split: str = "test"
