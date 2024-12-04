@@ -54,6 +54,7 @@ from transformers import (
     AutoConfig,
     AutoProcessor,
     AutoTokenizer,
+    AutoModelForCausalLM,
     BitsAndBytesConfig,
     LlamaForCausalLM,
     MllamaForConditionalGeneration,
@@ -162,18 +163,35 @@ def main(**kwargs):
         model.language_model.supports_gradient_checkpointing = True
     elif config.model_type == "llama":
         is_vision = False
-        model = LlamaForCausalLM.from_pretrained(
-            train_config.model_name,
-            quantization_config=bnb_config,
-            use_cache=use_cache,
-            attn_implementation="sdpa" if train_config.use_fast_kernels else None,
-            device_map=(
-                "auto"
-                if train_config.quantization and not train_config.enable_fsdp
-                else None
-            ),
-            torch_dtype=torch.float16 if train_config.use_fp16 else torch.bfloat16,
-        )
+        # add for model that train with wanda before
+        wanda=True
+        if wanda:
+            # Load the model
+            model = AutoModelForCausalLM.from_pretrained(
+                #modify the path to wanda model
+                # '../wanda/out/llama2_7b/unstructured/wanda/wanda_s50_unstructured',
+                '../wanda/out/llama2_7b/16_32/wanda/wanda_s50_16_32',
+                torch_dtype=torch.float16 if train_config.use_fp16 else torch.bfloat16,
+                low_cpu_mem_usage=True,
+                device_map="cuda",
+                attn_implementation="eager",
+            )
+            model.seqlen = 2048
+            model.to("cuda")
+            print("wanda wanda wanda ")
+        else:
+            model = LlamaForCausalLM.from_pretrained(
+                train_config.model_name,
+                quantization_config=bnb_config,
+                use_cache=use_cache,
+                attn_implementation="eager" if train_config.use_fast_kernels else None,
+                device_map=(
+                    "auto"
+                    if train_config.quantization and not train_config.enable_fsdp
+                    else None
+                ),
+                torch_dtype=torch.float16 if train_config.use_fp16 else torch.bfloat16,
+            )
     else:
         raise ValueError(
             f"Model type {config.model_type} is not supported. Please use llama or mllama model."

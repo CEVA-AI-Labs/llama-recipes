@@ -324,7 +324,55 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         save_train_params(train_config, fsdp_config, rank)
 
     return results
+def evaluate(model, tokenizer,dataset1=None, seq_len=2048):
+    """
+    Evaluate model perplexity on wikitext-2 test dataset as omniquant repo .
+    :param model:
+    :param tokenizer:
+    :return:
+    """
+    import os
+    from tqdm import tqdm
+    from datasets import load_dataset
+    model.to("cuda")
+    cache_testloader = f'cache/testloader_wikitext2.cache'
+    if os.path.exists(cache_testloader):
+        testloader = torch.load(cache_testloader)
+    else:
+        test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        testloader = tokenizer("\n\n".join(test["text"]), return_tensors="pt")
+        # torch.save(testloader, cache_testloader)
 
+    encodings = testloader.input_ids
+    nsamples = encodings.numel() // seq_len
+    nlls = []
+    model.eval()
+    with torch.no_grad():
+        for i in tqdm(range(nsamples),desc="Calculate Perplexity "):
+            batch = encodings[:, (i * seq_len): ((i + 1) * seq_len)].to('cuda:0')
+            # batch = encodings[:, (i * seq_len): ((i + 1) * seq_len)].to(model.device)
+            outputs = model(batch)
+            logits = outputs[0]
+            shift_logits = logits[:, :-1, :]
+            shift_labels = encodings[:, (i * seq_len): ((i + 1) * seq_len)][:, 1:].to(model.device)
+            loss_fct = torch.nn.CrossEntropyLoss()
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            )
+            neg_log_likelihood = loss.float() * seq_len
+            nlls.append(neg_log_likelihood)
+            # Save the variables to a dictionary
+            data = {
+                'logits': logits,
+                'shift_logits': shift_logits,
+                'batch': batch,
+                'shift_labels': shift_labels,
+                'loss': loss
+            }
+
+        ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * seq_len))
+    return ppl
 def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb_run):
     """
     Evaluates the model on the given dataloader

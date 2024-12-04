@@ -17,7 +17,7 @@ class train_config:
     gradient_accumulation_steps: int=1
     gradient_clipping: bool = False
     gradient_clipping_threshold: float = 1.0
-    num_epochs: int=3
+    num_epochs: int=1
     max_train_step: int=0
     max_eval_step: int=0
     num_workers_dataloader: int=1
@@ -49,3 +49,7 @@ class train_config:
     flop_counter_start: int = 3 # The step to start profiling, default is 3, which means after 3 steps of warmup stage, the profiler will start to count flops.
     use_profiler: bool = False # Enable pytorch profiler, can not be used with flop counter at the same time.
     profiler_dir: str = "PATH/to/save/profiler/results" # will be used if using profiler
+    liteml_ptq: bool = False # Enable liteml ptq
+    liteml_config: str = "PATH/to/liteml_config" # will be used only if using liteml
+
+
