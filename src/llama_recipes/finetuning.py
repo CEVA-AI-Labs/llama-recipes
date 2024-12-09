@@ -45,6 +45,7 @@ from llama_recipes.utils.train_utils import (
     setup,
     setup_environ_flags,
     train,
+    train_lkd,
 )
 from peft import get_peft_model, PeftModel
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy
@@ -164,7 +165,7 @@ def main(**kwargs):
     elif config.model_type == "llama":
         is_vision = False
         # add for model that train with wanda before
-        wanda=True
+        wanda=False
         if wanda:
             # Load the model
             model = AutoModelForCausalLM.from_pretrained(
@@ -183,8 +184,8 @@ def main(**kwargs):
             model = LlamaForCausalLM.from_pretrained(
                 train_config.model_name,
                 quantization_config=bnb_config,
-                use_cache=use_cache,
-                attn_implementation="eager" if train_config.use_fast_kernels else None,
+                use_cache=False,
+                attn_implementation="eager" ,
                 device_map=(
                     "auto"
                     if train_config.quantization and not train_config.enable_fsdp
@@ -421,20 +422,36 @@ def main(**kwargs):
             weight_decay=train_config.weight_decay,
         )
     scheduler = StepLR(optimizer, step_size=1, gamma=train_config.gamma)
-    results = train(
-        model,
-        train_dataloader,
-        eval_dataloader,
-        tokenizer,
-        optimizer,
-        scheduler,
-        train_config.gradient_accumulation_steps,
-        train_config,
-        fsdp_config if train_config.enable_fsdp else None,
-        local_rank if train_config.enable_fsdp else None,
-        rank if train_config.enable_fsdp else None,
-        wandb_run,
-    )
+    if train_config.liteml_lkd:
+        results = train_lkd(
+            model,
+            train_dataloader,
+            eval_dataloader,
+            tokenizer,
+            optimizer,
+            scheduler,
+            train_config.gradient_accumulation_steps,
+            train_config,
+            fsdp_config if train_config.enable_fsdp else None,
+            local_rank if train_config.enable_fsdp else None,
+            rank if train_config.enable_fsdp else None,
+            wandb_run,
+        )
+    else:
+        results = train(
+            model,
+            train_dataloader,
+            eval_dataloader,
+            tokenizer,
+            optimizer,
+            scheduler,
+            train_config.gradient_accumulation_steps,
+            train_config,
+            fsdp_config if train_config.enable_fsdp else None,
+            local_rank if train_config.enable_fsdp else None,
+            rank if train_config.enable_fsdp else None,
+            wandb_run,
+        )
     if not train_config.enable_fsdp or rank == 0:
         [print(f"Key: {k}, Value: {v}") for k, v in results.items()]
         if train_config.use_wandb:

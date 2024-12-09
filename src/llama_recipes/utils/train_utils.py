@@ -24,7 +24,9 @@ from llama_recipes.model_checkpointing import save_fsdp_model_checkpoint_full, s
 from llama_recipes.policies import fpSixteen,bfSixteen, get_llama_wrapper
 from llama_recipes.utils.memory_utils import MemoryTrace
 from accelerate.utils import is_xpu_available, is_ccl_available
+from llama_recipes.policies import AnyPrecisionAdamW, apply_fsdp_checkpointing
 from llama_recipes.utils.flop_utils import FlopMeasure
+
 def set_tokenizer_params(tokenizer: LlamaTokenizer):
     tokenizer.pad_token_id = 0
     tokenizer.padding_side = "left"
@@ -143,7 +145,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                             if is_xpu_available():
                                 batch[key] = batch[key].to(torch.device(f"xpu:{local_rank}"))
                             else:
-                                batch[key] = batch[key].to(local_rank)
+                                batch[key] = batch[key].to(local_rank)[0]
                         else:
                             if is_xpu_available():
                                 batch[key] = batch[key].to('xpu:0')
@@ -324,7 +326,402 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         save_train_params(train_config, fsdp_config, rank)
 
     return results
-def evaluate(model, tokenizer,dataset1=None, seq_len=2048):
+
+def train_lkd(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_scheduler, gradient_accumulation_steps, train_config, fsdp_config=None, local_rank=None, rank=None, wandb_run=None):
+
+    from torch import nn
+    import copy
+    from torch.optim.lr_scheduler import StepLR
+    from liteml.ailabs_quant.quant_modules import Quantizer
+    """
+    Trains the model on the given dataloader
+
+    Args:
+        model: The model to be trained
+        train_dataloader: The dataloader containing the training data
+        optimizer: The optimizer used for training
+        lr_scheduler: The learning rate scheduler
+        gradient_accumulation_steps: The number of steps to accumulate gradients before performing a backward/update operation
+        num_epochs: The number of epochs to train for
+        local_rank: The rank of the current node in a distributed setting
+        train_config: The training configuration
+        eval_dataloader: The dataloader containing the eval data
+        tokenizer: tokenizer used in the eval for decoding the predicitons
+
+    Returns: results dictionary containing average training and validation perplexity and loss
+    """
+
+    def set_quantization(layer, is_quantized):
+
+        for name, module in layer.named_modules():
+            if isinstance(module, Quantizer):
+                # print("lol")
+                module.quantize = is_quantized
+        return layer
+
+    dtype=model.dtype
+    optimizer=None
+    lr_scheduler=None
+    # Create a gradient scaler for fp16
+    if train_config.use_fp16 and train_config.enable_fsdp:
+        scaler = ShardedGradScaler()
+    elif train_config.use_fp16 and not train_config.enable_fsdp:
+        scaler = torch.cuda.amp.GradScaler()
+    if train_config.enable_fsdp:
+        world_size = int(os.environ["WORLD_SIZE"])
+    autocast = torch.cuda.amp.autocast if train_config.use_fp16 else nullcontext
+    # eval before train
+    with torch.no_grad():
+        model.eval()
+        if train_config.run_validation:
+            model.eval()
+            eval_ppl, eval_epoch_loss, temp_val_loss, temp_step_perplexity = evaluation(model, train_config,
+                                                                                        eval_dataloader, local_rank,
+                                                                                    tokenizer, wandb_run)
+
+            print(f"eval_ppl {eval_ppl},eval_epoch_loss {eval_epoch_loss}, temp_val_loss {temp_val_loss}, temp_step_perplexity {temp_step_perplexity}")
+    model.train()
+    # Start the training loop
+    layers=model.model.layers
+
+    nsamples=len(train_dataloader.batch_sampler)
+    dev='cuda'
+    inps = torch.zeros(
+        (nsamples, train_config.context_length, model.config.hidden_size), dtype=dtype, device=dev
+    )
+    cache = {"i": 0}
+
+
+    # catch the first layer input
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+            self.is_llama = False
+
+        def forward(self, inp, **kwargs):
+            inps[cache["i"]] = inp
+            cache["i"] += 1
+            cache["attention_mask"] = kwargs.get("attention_mask")
+
+            if self.is_llama:
+                cache["position_ids"] = kwargs.get("position_ids")
+            raise ValueError
+
+    layers[0] = Catcher(layers[0])
+    layers[0].is_llama = True
+    model.model.embed_tokens = model.model.embed_tokens.cpu()
+    model.model.norm = model.model.norm.cpu()
+    torch.cuda.empty_cache()
+    loss_fn = torch.nn.MSELoss()
+    with torch.no_grad():
+        for batch in train_dataloader:
+            if cache["i"] >= nsamples:
+                break
+            try:
+                batch['input_ids'] = batch['input_ids'].squeeze(0)
+                model(**batch)
+            except ValueError:
+                pass
+    # move embedding layer and first layer to cpu
+    layers[0] = layers[0].module
+    layers[0] = layers[0].cpu()
+    model.model.embed_tokens = model.model.embed_tokens.cpu()
+    model.model.norm = model.model.norm.cpu()
+    position_ids = cache["position_ids"].cuda()
+    attention_mask = cache["attention_mask"].cuda()
+    # same input of first layer for fp model and quant model
+    quant_inps = inps.to(dtype)
+    fp_inps = copy.deepcopy(inps).to(dtype)   # take output of fp model as input
+    for i in range(len(layers)):
+        layer=layers[i].to(dev)
+        from liteml.ailabs_liteml.retrainer import RetrainerModel, RetrainerConfig
+        from liteml.ailabs_shared.load_config import load_config
+        # config_name = "config/w8a8_per_tensor_pc_dynamic_asy_mamtul pertoken_tensor.yaml"
+        # conf = load_config(config_name)
+        # layer = RetrainerModel(layer.module, config=RetrainerConfig(conf))
+        layer.train()
+
+        #take from deep speed
+        train_prep = []
+        train_loss = []
+        val_prep = []
+        val_loss = []
+
+        if train_config.save_metrics:
+            metrics_filename = f"{train_config.output_dir}/metrics_data_{local_rank}-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.json"
+            train_step_perplexity = []
+            train_step_loss = []
+            val_step_loss = []
+            val_step_perplexity = []
+
+        epoch_times = []
+        checkpoint_times = []
+        results = {}
+        best_val_loss = float("inf")
+        total_train_steps = 0
+        max_steps_reached = False  # Flag to indicate max training steps reached
+        with torch.no_grad():
+            with torch.cuda.amp.autocast():
+                float_layer = set_quantization(layer, False)
+                for j in range(nsamples):
+                    fp_inps[j] = float_layer(fp_inps[j].unsqueeze(0), attention_mask=attention_mask,
+                                        position_ids=position_ids)[0]
+
+        optimizer_base =AnyPrecisionAdamW(
+            layer.parameters(),
+            lr=train_config.lr,
+            momentum_dtype=dtype,
+            variance_dtype=dtype,
+            use_kahan_summation=False,
+            weight_decay=train_config.weight_decay,
+        )
+        lr_scheduler = StepLR(optimizer_base, step_size=1, gamma=train_config.gamma)
+
+        for epoch in range(train_config.num_epochs):
+            # stop when the maximum number of training steps is reached
+            # if max_steps_reached:
+            #     break
+            epoch_start_time = time.perf_counter()
+            with MemoryTrace() as memtrace:  # track the memory usage
+                model.train()
+                total_loss = 0.0
+                total_length = len(train_dataloader)//gradient_accumulation_steps
+                if rank==0:
+                    pbar = tqdm(colour="blue", desc=f"Training Epoch: {epoch+1}", total=total_length, dynamic_ncols=True)
+                for step, batch in enumerate(train_dataloader):
+                    model.train()
+                    # print(batch['input_ids'].shape)
+                    total_train_steps += 1
+                    # stop when the maximum number of training steps is reached
+                    if train_config.max_train_step > 0 and total_train_steps > train_config.max_train_step:
+                        max_steps_reached = True
+                        if not train_config.enable_fsdp or local_rank==0:
+                            print("max training steps reached, stopping training, total_train_steps: ", total_train_steps-1)
+                        break
+                    for key in batch.keys():
+                        if train_config.enable_fsdp:
+                            if is_xpu_available():
+                                batch[key] = batch[key].to(torch.device(f"xpu:{local_rank}"))
+                            else:
+                                batch[key] = batch[key].to(local_rank)[0]
+                        else:
+
+                            if is_xpu_available():
+                                batch[key] = batch[key].to('xpu:0')
+                            else:
+                                batch[key] = batch[key].to('cuda')[0]
+                                # batch[key] = batch[key].to('cuda:0')[0]
+
+                    # for sample in range(nsamples):
+                        # floating_point_out = set_quantization(layer, False)(fp_inps[sample])
+                    q_layer=set_quantization(layer, True)
+                    quant_point_out = q_layer(quant_inps[step].unsqueeze(0), attention_mask=attention_mask,
+                                                position_ids=position_ids)[0]
+                    with autocast():
+                            loss=loss_fn(quant_point_out.squeeze(), fp_inps[step])
+
+                        # student_output=model(**batch)
+                        # label_loss = model(**batch).loss
+                        # label_loss = student_output.loss
+                        # loss=loss_fn(student_output.logits, teacher_output.logits)
+                    loss = loss / gradient_accumulation_steps
+                    if train_config.save_metrics:
+                        train_step_loss.append(loss.detach().float().item())
+                        train_step_perplexity.append(float(torch.exp(loss.detach().float())))
+                    total_loss += loss.detach().float()
+                    if train_config.use_fp16:
+                        # if fp16 is enabled, use gradient scaler to handle gradient update
+                        # if rank==0:
+                        #     print(f"STEP: {step} q_proj Before backward  weights: {layer.module.self_attn.q_proj.final_weights}")
+                        scaler.scale(loss).backward()
+
+                        if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                            if train_config.gradient_clipping and train_config.gradient_clipping_threshold > 0.0:
+                                scaler.unscale_(optimizer_base)
+                                if train_config.enable_fsdp:
+                                    model.clip_grad_norm_(train_config.gradient_clipping_threshold)
+                                else:
+                                    torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.gradient_clipping_threshold)
+                            scaler.step(optimizer_base)
+                            scaler.update()
+                            # if rank == 0:
+                            #     print(f"STEP: {step} q_proj After scaler.update()  weights: {layer.module.self_attn.q_proj.final_weights}")
+                            optimizer_base.zero_grad()
+                            if rank == 0:
+                                pbar.update(1)
+                    else:
+                        # regular backpropagation when fp16 is not used
+                        loss.backward()
+                        # print("after loss backward")
+                        if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                            if train_config.gradient_clipping and train_config.gradient_clipping_threshold > 0.0:
+                                if train_config.enable_fsdp:
+                                    model.clip_grad_norm_(train_config.gradient_clipping_threshold)
+                                else:
+                                    torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.gradient_clipping_threshold)
+                            optimizer_base.step()
+                            optimizer_base.zero_grad()
+                            # pbar.update(1)
+
+                    if wandb_run:
+                        if not train_config.enable_fsdp or rank==0:
+                            wandb_run.log({
+                                'train/epoch': epoch + 1,
+                                'train/step': epoch * len(train_dataloader) + step,
+                                'train/loss': loss.detach().float(),
+                            })
+                    if rank == 0:
+                        pbar.set_description(f"Layer{i} Training Epoch: {epoch+1}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} completed (loss: {loss.detach().float()}) lr:{lr_scheduler.optimizer.param_groups[0]['lr']}")
+
+                    if train_config.save_metrics:
+                        save_to_json(metrics_filename, train_step_loss, train_loss, train_step_perplexity, train_prep, val_step_loss, val_loss, val_step_perplexity, val_prep)
+            if rank == 0:
+                pbar.close()
+
+            epoch_end_time = time.perf_counter()-epoch_start_time
+            epoch_times.append(epoch_end_time)
+            # Reducing total_loss across all devices if there's more than one CUDA device
+
+            if is_xpu_available() and (torch.xpu.device_count() > 1 and train_config.enable_fsdp):
+                dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+            elif torch.cuda.device_count() > 1 and train_config.enable_fsdp:
+                dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+            train_epoch_loss = total_loss / len(train_dataloader)
+            if train_config.enable_fsdp:
+                train_epoch_loss = train_epoch_loss/world_size
+            # train_perplexity = torch.exp(train_epoch_loss)
+
+            # train_prep.append(float(train_perplexity))
+            train_loss.append(float(train_epoch_loss))
+
+            if not train_config.enable_fsdp or rank==0:
+                memtrace.print_stats()
+
+            # Update the learning rate as needed
+            lr_scheduler.step()
+            with torch.no_grad():
+                if train_config.run_validation:
+                    eval_ppl, eval_epoch_loss, temp_val_loss, temp_step_perplexity = evaluation(model, train_config, eval_dataloader, local_rank, tokenizer, wandb_run)
+                    torch.cuda.empty_cache()
+
+                    if train_config.save_metrics:
+                        val_step_loss.extend(temp_val_loss)
+                        val_step_perplexity.extend(temp_step_perplexity)
+
+                    checkpoint_start_time = time.perf_counter()
+                    if train_config.save_model and eval_epoch_loss < best_val_loss:
+                        if train_config.enable_fsdp:
+                            dist.barrier()
+                        if train_config.use_peft:
+                            if train_config.enable_fsdp:
+                                if rank==0:
+                                    print(f"we are about to save the PEFT modules")
+                            else:
+                                print(f"we are about to save the PEFT modules")
+                            model.save_pretrained(train_config.output_dir)
+                            if train_config.enable_fsdp:
+                                if rank==0:
+                                    print(f"PEFT modules are saved in {train_config.output_dir} directory")
+                            else:
+                                print(f"PEFT modules are saved in {train_config.output_dir} directory")
+
+                        else:
+                            if not train_config.use_peft and fsdp_config.checkpoint_type == StateDictType.FULL_STATE_DICT:
+
+                                save_model_checkpoint(
+                                    model, optimizer_base, rank, train_config, epoch=epoch
+                                )
+                            elif not train_config.use_peft and fsdp_config.checkpoint_type == StateDictType.SHARDED_STATE_DICT:
+                                print(" Saving the FSDP model checkpoints using SHARDED_STATE_DICT")
+                                print("=====================================================")
+
+                                save_model_and_optimizer_sharded(model, rank, train_config)
+                                if train_config.save_optimizer:
+                                    save_model_and_optimizer_sharded(model, rank, train_config, optim=optimizer_base)
+                                    print(" Saving the FSDP model checkpoints and optimizer using SHARDED_STATE_DICT")
+                                    print("=====================================================")
+
+                            if not train_config.use_peft and  train_config.save_optimizer:
+                                save_optimizer_checkpoint(
+                                    model, optimizer_base, rank, train_config, epoch=epoch
+                                )
+                                print(" Saving the FSDP model checkpoints and optimizer using FULL_STATE_DICT")
+                                print("=====================================================")
+                        if train_config.enable_fsdp:
+                            dist.barrier()
+                    checkpoint_end_time = time.perf_counter() - checkpoint_start_time
+                    checkpoint_times.append(checkpoint_end_time)
+                    if eval_epoch_loss < best_val_loss:
+                        best_val_loss = eval_epoch_loss
+                        if train_config.enable_fsdp:
+                            if rank==0:
+                                print(f"best eval loss on epoch {epoch+1} is {best_val_loss}")
+                        else:
+                            print(f"best eval loss on epoch {epoch+1} is {best_val_loss}")
+                    val_loss.append(float(best_val_loss))
+                    val_prep.append(float(eval_ppl))
+            if train_config.enable_fsdp and train_config.run_validation:
+                if rank == 0:
+                    print(
+                        f" Epoch {epoch + 1}: , train_epoch_loss={train_epoch_loss}, epoch time {epoch_end_time}s")
+                    print(f"eval PPL: {eval_ppl}")
+                    # print(f"eval PPL: {eval_ppl:.4f}")
+            else:
+                print(
+                    f"Epoch {epoch + 1}: , train_epoch_loss={train_epoch_loss}, epoch time {epoch_end_time}s")
+
+            # Saving the results every epoch to plot later
+            if train_config.save_metrics:
+                save_to_json(metrics_filename, train_step_loss, train_loss, train_step_perplexity, train_prep, val_step_loss, val_loss, val_step_perplexity, val_prep)
+        del optimizer_base
+        avg_epoch_time = sum(epoch_times) / len(epoch_times)
+        avg_checkpoint_time = sum(checkpoint_times) / len(checkpoint_times) if len(checkpoint_times) > 0 else 0
+        # avg_train_prep = sum(train_prep) / len(train_prep)
+        avg_train_loss = sum(train_loss) / len(train_loss)
+        if train_config.run_validation:
+            avg_eval_prep = sum(val_prep) / len(val_prep)
+            avg_eval_loss = sum(val_loss) / len(val_loss)
+
+        # results['avg_train_prep'] = avg_train_prep
+        results['avg_train_loss'] = avg_train_loss
+        if train_config.run_validation:
+            results['avg_eval_prep'] = avg_eval_prep
+            results['avg_eval_loss'] = avg_eval_loss
+            if rank==0:
+                print(f"$$ average eval prep{avg_eval_prep},avg_eval_loss= {avg_eval_loss} ")
+
+        results["avg_epoch_time"] = avg_epoch_time
+        results["avg_checkpoint_time"] = avg_checkpoint_time
+        if train_config.save_metrics:
+            results["metrics_filename"] = metrics_filename
+        with torch.no_grad():
+            # with torch.cuda.amp.autocast():
+            with autocast():
+                qlayer = set_quantization(layer, True)
+                for j in range(nsamples):
+                    quant_inps[step] = qlayer(quant_inps[step].unsqueeze(0), attention_mask=attention_mask,
+                                          position_ids=position_ids)[0]
+            # layer[i]=qlayer.to("cpu")
+            layer.eval()
+        del layer
+        torch.cuda.empty_cache()
+
+    #saving the training params including fsdp setting for reference.
+    if train_config.enable_fsdp and not train_config.use_peft and rank==0:
+        save_train_params(train_config, fsdp_config, rank)
+
+    print("##########finish___layers#####")
+
+    with torch.no_grad():
+        model.eval()
+        eval_ppl, eval_epoch_loss, temp_val_loss, temp_step_perplexity = evaluation(model, train_config,
+                                                                                    eval_dataloader, local_rank,
+                                                                                tokenizer, wandb_run)
+        print(f"eval_ppl {eval_ppl},eval_epoch_loss {eval_epoch_loss}, temp_val_loss {temp_val_loss}, temp_step_perplexity {temp_step_perplexity}")
+    return results
+
+def evaluate_wikitext(model, tokenizer,dataset1=None, seq_len=2048):
     """
     Evaluate model perplexity on wikitext-2 test dataset as omniquant repo .
     :param model:
@@ -403,7 +800,7 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
                 break
             for key in batch.keys():
                 if train_config.enable_fsdp:
-                    batch[key] = batch[key].to(local_rank)
+                    batch[key] = batch[key].to(local_rank)[0]
                 else:
                     if is_xpu_available():
                         batch[key] = batch[key].to('xpu:0')

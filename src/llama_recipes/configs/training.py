@@ -11,8 +11,9 @@ class train_config:
     enable_fsdp: bool=False # shards model parameters, optimizer states and gradients across DDP ranks
     low_cpu_fsdp: bool=False # saves cpu memory by loading pretrained model on rank0 only
     run_validation: bool=True
-    batch_size_training: int=4
-    batching_strategy: str="packing" #alternative: padding
+    batch_size_training: int=1
+    # batching_strategy: str="packing" #alternative: padding
+    batching_strategy: str="padding" #alternative: padding
     context_length: int=2048 #defulat for NPR<
     gradient_accumulation_steps: int=1
     gradient_clipping: bool = False
@@ -51,5 +52,6 @@ class train_config:
     profiler_dir: str = "PATH/to/save/profiler/results" # will be used if using profiler
     liteml_ptq: bool = False # Enable liteml ptq
     liteml_config: str = "PATH/to/liteml_config" # will be used only if using liteml
+    liteml_lkd: bool = False # Enable layer knowledge distillation
 
 

@@ -12,18 +12,15 @@ def get_wikitext_dataset(dataset_config, tokenizer, split: str = "train"):
     tokenized_datasets = dataset.map(tokenize_function, batched=True, num_proc=4, remove_columns=["text"])
 
     # Define the function to group texts into blocks
-    def group_texts(examples):
-        concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(examples.keys())[0]])
-        total_length = (total_length // block_size) * block_size
+    def group_texts(concatenated_examples):
         result = {
-            k: [t[i: i + block_size] for i in range(0, total_length, block_size)]
+            k: [t[i: i + block_size] for i in range(0, len(concatenated_examples), block_size)]
             for k, t in concatenated_examples.items()
         }
         result["labels"] = result["input_ids"].copy()
         return result
 
     # Apply the grouping function to the tokenized dataset
-    lm_datasets = tokenized_datasets.map(group_texts, batched=True)
+    lm_datasets = tokenized_datasets.map(group_texts, batched=False)
 
     return lm_datasets
