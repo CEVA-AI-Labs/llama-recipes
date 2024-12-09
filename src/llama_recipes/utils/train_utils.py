@@ -435,11 +435,6 @@ def train_lkd(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_
     fp_inps = copy.deepcopy(inps).to(dtype)   # take output of fp model as input
     for i in range(len(layers)):
         layer=layers[i].to(dev)
-        from liteml.ailabs_liteml.retrainer import RetrainerModel, RetrainerConfig
-        from liteml.ailabs_shared.load_config import load_config
-        # config_name = "config/w8a8_per_tensor_pc_dynamic_asy_mamtul pertoken_tensor.yaml"
-        # conf = load_config(config_name)
-        # layer = RetrainerModel(layer.module, config=RetrainerConfig(conf))
         layer.train()
 
         #take from deep speed

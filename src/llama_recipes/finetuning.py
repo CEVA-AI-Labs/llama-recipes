@@ -46,6 +46,7 @@ from llama_recipes.utils.train_utils import (
     setup_environ_flags,
     train,
     train_lkd,
+    evaluate_wikitext,
 )
 from peft import get_peft_model, PeftModel
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy
@@ -215,7 +216,36 @@ def main(**kwargs):
         model.resize_token_embeddings(len(tokenizer))
 
     print_model_size(model, train_config, rank if train_config.enable_fsdp else 0)
-    
+    # when we run lkd we want to wrap the model with liteml
+    if train_config.liteml_lkd:
+        from liteml.ailabs_liteml.retrainer import RetrainerModel, RetrainerConfig
+        from liteml.ailabs_shared.load_config import load_config
+
+        conf = load_config(train_config.liteml_config)
+
+        def get_calibration_loader(seq_len=2048):
+            from datasets import load_dataset
+            print("%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%")
+            calib = load_dataset("wikitext", "wikitext-2-raw-v1", split="train[0:10%]")
+            calibloader = tokenizer("\n\n".join(calib["text"]), return_tensors="pt")
+
+            encodings = calibloader.input_ids
+            nsamples = encodings.numel() // seq_len
+            batch = [encodings[:, (i * seq_len): ((i + 1) * seq_len)] for i in range(nsamples)]
+            return batch
+        if conf["QAT"]["data_quantization"]["quantization_mode"] == "static":
+            calib_loader = get_calibration_loader(seq_len=train_config.context_length)
+            # conf = RetrainerConfig(config_name)
+            conf["QAT"]["data_quantization"][
+                "calibration_loader"
+            ] = calib_loader
+            conf["QAT"]["data_quantization"][
+                "calibration_loader_key"
+            ] = lambda model, x: model(x.cuda(
+            ))
+        model = model.to('cuda')
+        model = RetrainerModel(model, config=RetrainerConfig(conf))
+
     # Convert the model to bfloat16 if fsdp and pure_bf16 is enabled
     if (
         train_config.enable_fsdp
@@ -452,6 +482,15 @@ def main(**kwargs):
             rank if train_config.enable_fsdp else None,
             wandb_run,
         )
+        if train_config.liteml_ptq:
+            from liteml.ailabs_liteml.retrainer import RetrainerModel, RetrainerConfig
+            from liteml.ailabs_shared.load_config import load_config
+
+            conf = load_config(train_config.liteml_config)
+            model = RetrainerModel(model, config=RetrainerConfig(conf))
+            ppl = evaluate_wikitext(model, tokenizer)
+            print(f'Perplexity: {ppl:.4}')
+
     if not train_config.enable_fsdp or rank == 0:
         [print(f"Key: {k}, Value: {v}") for k, v in results.items()]
         if train_config.use_wandb:
